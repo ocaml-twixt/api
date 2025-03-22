@@ -153,6 +153,17 @@ module ConnManager = struct
     unsubscribe cmgr cid;
     Hashtbl.remove cmgr.tracking cid
   ;;
+
+  let iter cmgr gid f =
+    let s = Hashtbl.find cmgr.subs gid in
+    IdSet.fold
+      (fun x acc ->
+        match Hashtbl.find_opt cmgr.tracking x with
+        | None -> acc
+        | Some (conn, _, _) -> f conn :: acc)
+      s
+      []
+  ;;
 end
 
 let websocket client (cid, cmgr) (message : Wsmes.complete_message) =
@@ -184,7 +195,35 @@ let websocket client (cid, cmgr) (message : Wsmes.complete_message) =
   | Wsmes.MChatSend _ -> Dream.send client "hi"
   | Wsmes.MGameAction _ -> Dream.send client "hi"
   | Wsmes.MResign -> Dream.send client "hi"
-  | Wsmes.MDraw -> Dream.send client "hi"
+  | Wsmes.MDraw ->
+    (match ConnManager.get_track cmgr cid with
+     | None, _ ->
+       Wsmes.{ data = Wsmes.RNotOk "not subscribed to any board"; id = message.id }
+       |> Wsmes.json_of
+       |> Dream.send client
+     | _, None ->
+       Wsmes.{ data = Wsmes.RNotOk "not logged in"; id = message.id }
+       |> Wsmes.json_of
+       |> Dream.send client
+     | Some gid, Some { user_id; _ } ->
+       (match%lwt Store.Game.Cache.fetch_opt gid with
+        | Ok (Some cg) ->
+          if cg.game_info.red = user_id || cg.game_info.black = user_id
+          then (
+            let res = Wsmes.{ data = Wsmes.DrawAsked; id = None } |> Wsmes.json_of in
+            ConnManager.iter cmgr gid (fun c -> Dream.send c res) |> Lwt.pick)
+          else
+            Wsmes.{ data = Wsmes.RNotOk "not playing"; id = message.id }
+            |> Wsmes.json_of
+            |> Dream.send client
+        | Ok None ->
+          Wsmes.{ data = Wsmes.RNotOk "unknown game"; id = message.id }
+          |> Wsmes.json_of
+          |> Dream.send client
+        | Error _ ->
+          Wsmes.{ data = Wsmes.RNotOk "internal server error"; id = message.id }
+          |> Wsmes.json_of
+          |> Dream.send client))
   | Wsmes.Subscribe sid ->
     (match%lwt Store.Game.fetch ~id:sid with
      | Ok _ ->
